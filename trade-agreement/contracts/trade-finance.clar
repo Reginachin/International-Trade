@@ -13,6 +13,7 @@
 (define-constant ERR-NO-ACTIVE-DISPUTE (err u7))
 (define-constant ERR-INVALID-DISPUTE-RESOLUTION (err u8))
 (define-constant ERR-DISPUTE-DEADLINE-PASSED (err u9))
+(define-constant ERR-INVALID-INPUT (err u10))
 
 ;; Contract variables
 (define-data-var trade-contract-administrator principal tx-sender)
@@ -83,6 +84,12 @@
         (asserts! (is-eq tx-sender (var-get trade-contract-administrator)) ERR-UNAUTHORIZED-ACCESS)
         (asserts! (is-none existing-letter-of-credit) ERR-TRADE-ALREADY-EXISTS)
         (asserts! (> expiration-date block-height) ERR-TRADE-EXPIRED)
+        (asserts! (and 
+            (is-ok (principal-destruct? exporting-entity))
+            (is-ok (principal-destruct? issuing-bank))
+            (is-ok (principal-destruct? payment-currency))
+        ) ERR-INVALID-INPUT)
+        (asserts! (> transaction-amount u0) ERR-INVALID-INPUT)
         
         (ok (map-set letter-of-credit-details
             { letter-of-credit-id: letter-of-credit-id }
@@ -117,6 +124,8 @@
         ) ERR-UNAUTHORIZED-ACCESS)
         (asserts! (is-none existing-dispute) ERR-DISPUTE-ALREADY-EXISTS)
         (asserts! (not (is-eq (get trade-status letter-of-credit) TRADE-STATUS-TRANSACTION-COMPLETED)) ERR-INVALID-TRADE-STATE)
+        (asserts! (> (len dispute-reason) u0) ERR-INVALID-INPUT)
+        (asserts! (> disputed-amount u0) ERR-INVALID-INPUT)
         
         ;; Update trade status
         (map-set letter-of-credit-details
@@ -174,6 +183,7 @@
         (asserts! (is-eq tx-sender (get issuing-bank letter-of-credit)) ERR-UNAUTHORIZED-ACCESS)
         (asserts! (is-eq (get dispute-status dispute) DISPUTE-STATUS-IN-REVIEW) ERR-INVALID-DISPUTE-RESOLUTION)
         (asserts! (is-eq (contract-of token-trait) (get payment-currency letter-of-credit)) ERR-UNAUTHORIZED-ACCESS)
+        (asserts! (> (len resolution) u0) ERR-INVALID-INPUT)
         
         ;; Process resolution payment if needed
         (if (> resolution-payment u0)
@@ -217,6 +227,7 @@
         
         (asserts! (is-eq tx-sender (get issuing-bank letter-of-credit)) ERR-UNAUTHORIZED-ACCESS)
         (asserts! (is-eq (get dispute-status dispute) DISPUTE-STATUS-IN-REVIEW) ERR-INVALID-DISPUTE-RESOLUTION)
+        (asserts! (> (len rejection-reason) u0) ERR-INVALID-INPUT)
         
         ;; Update dispute record
         (map-set trade-disputes
@@ -264,6 +275,7 @@
         (asserts! (is-eq tx-sender (get exporting-entity letter-of-credit)) ERR-UNAUTHORIZED-ACCESS)
         (asserts! (is-eq (get trade-status letter-of-credit) TRADE-STATUS-INITIATED) ERR-INVALID-TRADE-STATE)
         (asserts! (< block-height (get expiration-date letter-of-credit)) ERR-TRADE-EXPIRED)
+        (asserts! (not (is-eq shipping-documents-hash 0x)) ERR-INVALID-INPUT)
         
         (ok (map-set letter-of-credit-details
             { letter-of-credit-id: letter-of-credit-id }
@@ -299,7 +311,8 @@
     (let ((letter-of-credit (unwrap! (get-letter-of-credit-details letter-of-credit-id) ERR-INVALID-TRADE-STATE)))
         (asserts! (is-eq tx-sender (get issuing-bank letter-of-credit)) ERR-UNAUTHORIZED-ACCESS)
         (asserts! (is-eq (get trade-status letter-of-credit) TRADE-STATUS-DOCUMENTS-VERIFIED) ERR-INVALID-TRADE-STATE)
-        (asserts! (< block-height (get expiration-date letter-of-credit)) ERR-TRADE-EXPIRED)
+        (asserts! 
+        (< block-height (get expiration-date letter-of-credit)) ERR-TRADE-EXPIRED)
         (asserts! (is-eq (contract-of token-trait) (get payment-currency letter-of-credit)) ERR-UNAUTHORIZED-ACCESS)
         
         ;; Transfer tokens using SIP-010 trait
