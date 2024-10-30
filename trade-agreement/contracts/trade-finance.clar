@@ -71,8 +71,6 @@
 (define-constant DISPUTE-STATUS-RESOLVED "RESOLVED")
 (define-constant DISPUTE-STATUS-REJECTED "REJECTED")
 
-;; Public functions
-
 ;; Initialize new letter of credit
 (define-public (create-letter-of-credit 
                 (letter-of-credit-id uint) 
@@ -104,8 +102,6 @@
     )
 )
 
-;; Dispute Resolution Functions
-
 ;; File a dispute
 (define-public (file-trade-dispute 
                 (letter-of-credit-id uint)
@@ -123,13 +119,13 @@
         (asserts! (not (is-eq (get trade-status letter-of-credit) TRADE-STATUS-TRANSACTION-COMPLETED)) ERR-INVALID-TRADE-STATE)
         
         ;; Update trade status
-        (try! (map-set letter-of-credit-details
+        (map-set letter-of-credit-details
             { letter-of-credit-id: letter-of-credit-id }
             (merge letter-of-credit {
                 trade-status: TRADE-STATUS-IN-DISPUTE,
                 has-active-dispute: true
             })
-        ))
+        )
         
         ;; Create dispute record
         (ok (map-set trade-disputes
@@ -169,30 +165,29 @@
 (define-public (resolve-trade-dispute 
                 (letter-of-credit-id uint)
                 (resolution (string-utf8 500))
-                (resolution-payment uint))
+                (resolution-payment uint)
+                (token-trait <sip-010-trait>))
     (let ((letter-of-credit (unwrap! (get-letter-of-credit-details letter-of-credit-id) ERR-INVALID-TRADE-STATE))
           (dispute (unwrap! (get-trade-dispute letter-of-credit-id) ERR-NO-ACTIVE-DISPUTE)))
         
         ;; Verify bank authorization and dispute state
         (asserts! (is-eq tx-sender (get issuing-bank letter-of-credit)) ERR-UNAUTHORIZED-ACCESS)
         (asserts! (is-eq (get dispute-status dispute) DISPUTE-STATUS-IN-REVIEW) ERR-INVALID-DISPUTE-RESOLUTION)
+        (asserts! (is-eq (contract-of token-trait) (get payment-currency letter-of-credit)) ERR-UNAUTHORIZED-ACCESS)
         
-        ;; Process resolution payment if needed using if instead of when
+        ;; Process resolution payment if needed
         (if (> resolution-payment u0)
-            (let ((token-contract (contract-of (get payment-currency letter-of-credit))))
-                (try! (contract-call? token-contract transfer
-                    resolution-payment
-                    (get importing-entity letter-of-credit)
-                    (get exporting-entity letter-of-credit)
-                    none
-                ))
-            )
-            ;; If no payment is needed, evaluate to true to continue execution
+            (try! (contract-call? token-trait transfer
+                resolution-payment
+                (get importing-entity letter-of-credit)
+                (get exporting-entity letter-of-credit)
+                none
+            ))
             true
         )
         
         ;; Update dispute record
-        (try! (map-set trade-disputes
+        (map-set trade-disputes
             { letter-of-credit-id: letter-of-credit-id }
             (merge dispute {
                 dispute-status: DISPUTE-STATUS-RESOLVED,
@@ -200,7 +195,7 @@
                 dispute-resolver: (some tx-sender),
                 resolution-amount: (some resolution-payment)
             })
-        ))
+        )
         
         ;; Update trade status
         (ok (map-set letter-of-credit-details
@@ -221,17 +216,17 @@
           (dispute (unwrap! (get-trade-dispute letter-of-credit-id) ERR-NO-ACTIVE-DISPUTE)))
         
         (asserts! (is-eq tx-sender (get issuing-bank letter-of-credit)) ERR-UNAUTHORIZED-ACCESS)
-        (asserts! (is-eq (get dispute-status dispute) DISPUTE-STATUS-IN_REVIEW) ERR-INVALID-DISPUTE-RESOLUTION)
+        (asserts! (is-eq (get dispute-status dispute) DISPUTE-STATUS-IN-REVIEW) ERR-INVALID-DISPUTE-RESOLUTION)
         
         ;; Update dispute record
-        (try! (map-set trade-disputes
+        (map-set trade-disputes
             { letter-of-credit-id: letter-of-credit-id }
             (merge dispute {
                 dispute-status: DISPUTE-STATUS-REJECTED,
                 dispute-resolution: (some rejection-reason),
                 dispute-resolver: (some tx-sender)
             })
-        ))
+        )
         
         ;; Revert trade status to previous state
         (ok (map-set letter-of-credit-details
@@ -245,13 +240,10 @@
 )
 
 ;; Read-only functions for dispute management
-
-;; Get dispute details
 (define-read-only (get-trade-dispute (letter-of-credit-id uint))
     (map-get? trade-disputes { letter-of-credit-id: letter-of-credit-id })
 )
 
-;; Check if dispute deadline has passed
 (define-read-only (is-dispute-deadline-passed (letter-of-credit-id uint))
     (match (get-trade-dispute letter-of-credit-id)
         dispute (> block-height (+ (get dispute-filing-time dispute) (var-get dispute-resolution-period)))
@@ -259,7 +251,6 @@
     )
 )
 
-;; Get dispute status
 (define-read-only (get-dispute-status (letter-of-credit-id uint))
     (match (get-trade-dispute letter-of-credit-id)
         dispute (some (get dispute-status dispute))
@@ -304,21 +295,20 @@
 )
 
 ;; Process payment for verified documents
-(define-public (process-trade-payment (letter-of-credit-id uint))
+(define-public (process-trade-payment (letter-of-credit-id uint) (token-trait <sip-010-trait>))
     (let ((letter-of-credit (unwrap! (get-letter-of-credit-details letter-of-credit-id) ERR-INVALID-TRADE-STATE)))
         (asserts! (is-eq tx-sender (get issuing-bank letter-of-credit)) ERR-UNAUTHORIZED-ACCESS)
         (asserts! (is-eq (get trade-status letter-of-credit) TRADE-STATUS-DOCUMENTS-VERIFIED) ERR-INVALID-TRADE-STATE)
         (asserts! (< block-height (get expiration-date letter-of-credit)) ERR-TRADE-EXPIRED)
+        (asserts! (is-eq (contract-of token-trait) (get payment-currency letter-of-credit)) ERR-UNAUTHORIZED-ACCESS)
         
         ;; Transfer tokens using SIP-010 trait
-        (let ((token-contract (contract-of (get payment-currency letter-of-credit))))
-            (try! (contract-call? token-contract transfer
-                (get transaction-amount letter-of-credit)
-                (get importing-entity letter-of-credit)
-                (get exporting-entity letter-of-credit)
-                none
-            ))
-        )
+        (try! (contract-call? token-trait transfer
+            (get transaction-amount letter-of-credit)
+            (get importing-entity letter-of-credit)
+            (get exporting-entity letter-of-credit)
+            none
+        ))
         
         (ok (map-set letter-of-credit-details
             { letter-of-credit-id: letter-of-credit-id }
