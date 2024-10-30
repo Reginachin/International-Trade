@@ -1,5 +1,5 @@
-;; Trade Finance Smart Contract
-;; Implements Letter of Credit (LC) functionality with multi-party verification
+;; Trade Finance Smart Contract with Dispute Resolution
+;; Implements Letter of Credit (LC) functionality with multi-party verification and dispute handling
 
 (use-trait sip-010-trait .sip-010-trait.sip-010-trait)
 
@@ -9,9 +9,14 @@
 (define-constant ERR-TRADE-ALREADY-EXISTS (err u3))
 (define-constant ERR-TRADE-EXPIRED (err u4))
 (define-constant ERR-INSUFFICIENT-TRADE-FUNDS (err u5))
+(define-constant ERR-DISPUTE-ALREADY-EXISTS (err u6))
+(define-constant ERR-NO-ACTIVE-DISPUTE (err u7))
+(define-constant ERR-INVALID-DISPUTE-RESOLUTION (err u8))
+(define-constant ERR-DISPUTE-DEADLINE-PASSED (err u9))
 
 ;; Contract variables
 (define-data-var trade-contract-administrator principal tx-sender)
+(define-data-var dispute-resolution-period uint u720) ;; ~3 days in blocks
 
 ;; Comprehensive trade information storage
 (define-map letter-of-credit-details
@@ -25,7 +30,23 @@
         expiration-date: uint,
         trade-status: (string-ascii 20),
         shipping-documents-hash: (buff 32),
-        trade-active-status: bool
+        trade-active-status: bool,
+        has-active-dispute: bool
+    }
+)
+
+;; Dispute tracking system
+(define-map trade-disputes
+    { letter-of-credit-id: uint }
+    {
+        dispute-initiator: principal,
+        dispute-reason: (string-utf8 500),
+        dispute-amount: uint,
+        dispute-filing-time: uint,
+        dispute-status: (string-ascii 20),
+        dispute-resolution: (optional (string-utf8 500)),
+        dispute-resolver: (optional principal),
+        resolution-amount: (optional uint)
     }
 )
 
@@ -41,6 +62,14 @@
 (define-constant TRADE-STATUS-DOCUMENTS-VERIFIED "VERIFIED")
 (define-constant TRADE-STATUS-TRANSACTION-COMPLETED "COMPLETED")
 (define-constant TRADE-STATUS-TRANSACTION-CANCELLED "CANCELLED")
+(define-constant TRADE-STATUS-IN-DISPUTE "IN_DISPUTE")
+(define-constant TRADE-STATUS-DISPUTE-RESOLVED "DISPUTE_RESOLVED")
+
+;; Dispute status constants
+(define-constant DISPUTE-STATUS-FILED "FILED")
+(define-constant DISPUTE-STATUS-IN-REVIEW "IN_REVIEW")
+(define-constant DISPUTE-STATUS-RESOLVED "RESOLVED")
+(define-constant DISPUTE-STATUS-REJECTED "REJECTED")
 
 ;; Public functions
 
@@ -68,9 +97,173 @@
                 expiration-date: expiration-date,
                 trade-status: TRADE-STATUS-INITIATED,
                 shipping-documents-hash: 0x00,
-                trade-active-status: true
+                trade-active-status: true,
+                has-active-dispute: false
             }
         ))
+    )
+)
+
+;; Dispute Resolution Functions
+
+;; File a dispute
+(define-public (file-trade-dispute 
+                (letter-of-credit-id uint)
+                (dispute-reason (string-utf8 500))
+                (disputed-amount uint))
+    (let ((letter-of-credit (unwrap! (get-letter-of-credit-details letter-of-credit-id) ERR-INVALID-TRADE-STATE))
+          (existing-dispute (get-trade-dispute letter-of-credit-id)))
+        
+        ;; Verify authorization and conditions
+        (asserts! (or 
+            (is-eq tx-sender (get importing-entity letter-of-credit))
+            (is-eq tx-sender (get exporting-entity letter-of-credit))
+        ) ERR-UNAUTHORIZED-ACCESS)
+        (asserts! (is-none existing-dispute) ERR-DISPUTE-ALREADY-EXISTS)
+        (asserts! (not (is-eq (get trade-status letter-of-credit) TRADE-STATUS-TRANSACTION-COMPLETED)) ERR-INVALID-TRADE-STATE)
+        
+        ;; Update trade status
+        (try! (map-set letter-of-credit-details
+            { letter-of-credit-id: letter-of-credit-id }
+            (merge letter-of-credit {
+                trade-status: TRADE-STATUS-IN-DISPUTE,
+                has-active-dispute: true
+            })
+        ))
+        
+        ;; Create dispute record
+        (ok (map-set trade-disputes
+            { letter-of-credit-id: letter-of-credit-id }
+            {
+                dispute-initiator: tx-sender,
+                dispute-reason: dispute-reason,
+                dispute-amount: disputed-amount,
+                dispute-filing-time: block-height,
+                dispute-status: DISPUTE-STATUS-FILED,
+                dispute-resolution: none,
+                dispute-resolver: none,
+                resolution-amount: none
+            }
+        ))
+    )
+)
+
+;; Review dispute (Bank only)
+(define-public (review-trade-dispute (letter-of-credit-id uint))
+    (let ((letter-of-credit (unwrap! (get-letter-of-credit-details letter-of-credit-id) ERR-INVALID-TRADE-STATE))
+          (dispute (unwrap! (get-trade-dispute letter-of-credit-id) ERR-NO-ACTIVE-DISPUTE)))
+        
+        (asserts! (is-eq tx-sender (get issuing-bank letter-of-credit)) ERR-UNAUTHORIZED-ACCESS)
+        (asserts! (is-eq (get dispute-status dispute) DISPUTE-STATUS-FILED) ERR-INVALID-DISPUTE-RESOLUTION)
+        
+        (ok (map-set trade-disputes
+            { letter-of-credit-id: letter-of-credit-id }
+            (merge dispute {
+                dispute-status: DISPUTE-STATUS-IN-REVIEW
+            })
+        ))
+    )
+)
+
+;; Resolve dispute (Bank only)
+(define-public (resolve-trade-dispute 
+                (letter-of-credit-id uint)
+                (resolution (string-utf8 500))
+                (resolution-payment uint))
+    (let ((letter-of-credit (unwrap! (get-letter-of-credit-details letter-of-credit-id) ERR-INVALID-TRADE-STATE))
+          (dispute (unwrap! (get-trade-dispute letter-of-credit-id) ERR-NO-ACTIVE-DISPUTE)))
+        
+        ;; Verify bank authorization and dispute state
+        (asserts! (is-eq tx-sender (get issuing-bank letter-of-credit)) ERR-UNAUTHORIZED-ACCESS)
+        (asserts! (is-eq (get dispute-status dispute) DISPUTE-STATUS-IN-REVIEW) ERR-INVALID-DISPUTE-RESOLUTION)
+        
+        ;; Process resolution payment if needed using if instead of when
+        (if (> resolution-payment u0)
+            (let ((token-contract (contract-of (get payment-currency letter-of-credit))))
+                (try! (contract-call? token-contract transfer
+                    resolution-payment
+                    (get importing-entity letter-of-credit)
+                    (get exporting-entity letter-of-credit)
+                    none
+                ))
+            )
+            ;; If no payment is needed, evaluate to true to continue execution
+            true
+        )
+        
+        ;; Update dispute record
+        (try! (map-set trade-disputes
+            { letter-of-credit-id: letter-of-credit-id }
+            (merge dispute {
+                dispute-status: DISPUTE-STATUS-RESOLVED,
+                dispute-resolution: (some resolution),
+                dispute-resolver: (some tx-sender),
+                resolution-amount: (some resolution-payment)
+            })
+        ))
+        
+        ;; Update trade status
+        (ok (map-set letter-of-credit-details
+            { letter-of-credit-id: letter-of-credit-id }
+            (merge letter-of-credit {
+                trade-status: TRADE-STATUS-DISPUTE-RESOLVED,
+                has-active-dispute: false
+            })
+        ))
+    )
+)
+
+;; Reject dispute (Bank only)
+(define-public (reject-trade-dispute 
+                (letter-of-credit-id uint)
+                (rejection-reason (string-utf8 500)))
+    (let ((letter-of-credit (unwrap! (get-letter-of-credit-details letter-of-credit-id) ERR-INVALID-TRADE-STATE))
+          (dispute (unwrap! (get-trade-dispute letter-of-credit-id) ERR-NO-ACTIVE-DISPUTE)))
+        
+        (asserts! (is-eq tx-sender (get issuing-bank letter-of-credit)) ERR-UNAUTHORIZED-ACCESS)
+        (asserts! (is-eq (get dispute-status dispute) DISPUTE-STATUS-IN_REVIEW) ERR-INVALID-DISPUTE-RESOLUTION)
+        
+        ;; Update dispute record
+        (try! (map-set trade-disputes
+            { letter-of-credit-id: letter-of-credit-id }
+            (merge dispute {
+                dispute-status: DISPUTE-STATUS-REJECTED,
+                dispute-resolution: (some rejection-reason),
+                dispute-resolver: (some tx-sender)
+            })
+        ))
+        
+        ;; Revert trade status to previous state
+        (ok (map-set letter-of-credit-details
+            { letter-of-credit-id: letter-of-credit-id }
+            (merge letter-of-credit {
+                trade-status: TRADE-STATUS-DOCUMENTS-VERIFIED,
+                has-active-dispute: false
+            })
+        ))
+    )
+)
+
+;; Read-only functions for dispute management
+
+;; Get dispute details
+(define-read-only (get-trade-dispute (letter-of-credit-id uint))
+    (map-get? trade-disputes { letter-of-credit-id: letter-of-credit-id })
+)
+
+;; Check if dispute deadline has passed
+(define-read-only (is-dispute-deadline-passed (letter-of-credit-id uint))
+    (match (get-trade-dispute letter-of-credit-id)
+        dispute (> block-height (+ (get dispute-filing-time dispute) (var-get dispute-resolution-period)))
+        false
+    )
+)
+
+;; Get dispute status
+(define-read-only (get-dispute-status (letter-of-credit-id uint))
+    (match (get-trade-dispute letter-of-credit-id)
+        dispute (some (get dispute-status dispute))
+        none
     )
 )
 
